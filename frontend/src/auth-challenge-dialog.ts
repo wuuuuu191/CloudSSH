@@ -94,17 +94,20 @@ export function normalizeAuthChallengeMessage(value: unknown): AuthChallengeMess
     });
   }
 
+  const passwordFactor = value.method === 'password';
+  if (passwordFactor && (prompts.length !== 1 || prompts[0].echo)) return null;
+  if (passwordFactor) prompts[0].text = t('common.password');
   return {
     type: 'auth_challenge',
     id: value.id,
-    name: sanitizeAuthChallengeText(value.name, MAX_CHALLENGE_NAME_LENGTH),
-    instruction: sanitizeAuthChallengeText(
+    name: passwordFactor ? t('common.password') : sanitizeAuthChallengeText(value.name, MAX_CHALLENGE_NAME_LENGTH),
+    instruction: passwordFactor ? t('authChallenge.passwordFactor') : sanitizeAuthChallengeText(
       value.instruction,
       MAX_CHALLENGE_INSTRUCTION_LENGTH,
       true
     ),
     prompts,
-    canUseStoredPassword: value.canUseStoredPassword === true,
+    canUseStoredPassword: !passwordFactor && value.canUseStoredPassword === true,
   };
 }
 
@@ -272,6 +275,8 @@ export class AuthChallengeDialog {
       t(challenge.prompts.length === 0 ? 'authChallenge.continue' : 'authChallenge.respond')
     ) as HTMLButtonElement;
     submitButton.type = 'submit';
+    const initialFocus = inputs[0] ?? storedPasswordButton ?? submitButton;
+    initialFocus.autofocus = true;
 
     form.prepend(accent, header);
     form.append(target, description, promptList, sensitiveHint, actions);
@@ -324,7 +329,11 @@ export class AuthChallengeDialog {
 
     requestAnimationFrame(() => {
       if (this.dialog !== dialog) return;
-      (inputs[0] ?? storedPasswordButton ?? submitButton).focus();
+      // Native modal focus normally handles autofocus. A late fallback must not steal a field
+      // or button the user has already selected, including during a multi-prompt challenge.
+      const focused = document.activeElement;
+      if (focused !== dialog && dialog.contains(focused)) return;
+      initialFocus.focus();
     });
     return true;
   }

@@ -45,21 +45,125 @@ const LOCAL_ADMIN_GITHUB_ID = -1;
 export { LOCAL_ADMIN_GITHUB_ID };
 const LOCAL_ADMIN_ROUTE_KEY = String(LOCAL_ADMIN_GITHUB_ID);
 
+/** Cloudflare Access 模式下的哨兵用户 ID，避免与 GitHub 正整数或本地管理员 (-1) 碰撞 */
+export const CF_ACCESS_USER_GITHUB_ID = -2;
+
 /** 会话令牌内嵌的密码代际指纹长度（sha256 前 8 hex）；换 ADMIN_PASSWORD_HASH 即吊销全部旧会话 */
 const ADMIN_HASH_FINGERPRINT_LEN = 8;
 
-export type AuthMode = 'password' | 'github' | 'anonymous';
+export type AuthMode = 'password' | 'cf_access' | 'github' | 'anonymous';
+
+/** Browser account identity is distinct from native Access admission. Never trust HTTP headers. */
+const accessIdentities = new WeakMap<Request, string | null>();
+const accessAdmissions = new WeakSet<Request>();
+/** Native ctx.access is set by the runtime only after Access authenticates this invocation. */
+export function hasVerifiedAccessContext(request: Request): boolean {
+  return accessAdmissions.has(request);
+}
+
+export async function initializeAccessIdentity(
+  request: Request,
+  ctx?: Pick<ExecutionContext, 'access'>
+): Promise<void> {
+  accessIdentities.delete(request);
+  accessAdmissions.delete(request);
+  if (!ctx?.access) return;
+  // Keep Access mode even on malformed context/identity lookup failure: no GitHub fallback.
+  accessIdentities.set(request, null);
+  const aud = ctx.access.aud;
+  if (typeof aud !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(aud)) return;
+  accessAdmissions.add(request);
+  // Machine requests need native admission + their personal MCP token, not user profile data.
+  // Management APIs still resolve an email; /mcp/ and other paths are NOT this fast path.
+  if (new URL(request.url).pathname === '/mcp') return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const identity = await Promise.race([
+      ctx.access.getIdentity(),
+      new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 4000); }),
+    ]);
+    const email = identity?.email;
+    if (typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(email.trim())) {
+      accessIdentities.set(request, email.trim().toLowerCase());
+    }
+  } catch {
+    // Access verification must fail closed; do not log identity/JWT material.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export function getCFAccessEmail(request: Request): string | null {
+  return accessIdentities.get(request) ?? null;
+}
 
 /**
- * 认证模式解析（密码优先）：
+ * 生成基于邮箱的确定性 UserDBDO 路由键。
+ * 格式为 `cf-` 加 SHA-256 前 128 位。邮箱是 ASCII，旧的 FNV 高半段只随长度变化，
+ * 32 位碰撞会把两个 Access 用户送进同一个库。
+ */
+export async function getAccessUserRouteKey(email: string): Promise<string> {
+  const clean = email.toLowerCase().trim();
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(clean));
+  const hex = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+  // 路由键不含冒号，连接令牌仍是 `routeKey:secret`。不用邮箱前缀，避免把身份写进 DO 名称。
+  return `cf-${hex}`;
+}
+
+const ACCESS_USER_ROUTE_KEY_RE = /^cf-[0-9a-f]{32}$/;
+
+/** Access 用户的库不在哨兵 github_id=-2 上，而在按邮箱算出的路由键上。 */
+export async function userDbRouteKey(user: UserInfo): Promise<string> {
+  if (user.github_id === CF_ACCESS_USER_GITHUB_ID) {
+    const email = user.email?.trim() ?? '';
+    if (!email.includes('@')) {
+      throw new Error('Cloudflare Access user is missing a verified email');
+    }
+    return getAccessUserRouteKey(email);
+  }
+  return String(user.github_id);
+}
+
+export function isAccessUserRouteKey(value: string): boolean {
+  return ACCESS_USER_ROUTE_KEY_RE.test(value);
+}
+
+/**
+ * 一次性连接令牌是 `routeKey:secret`。Access 路由键是 `cf-` 加 32 位十六进制，
+ * 不含冒号，因此只取第一段。旧的 `cf:<prefix>-<fnv>` 键已废弃。
+ */
+export function connectTokenRouteKey(token: string): string | null {
+  if (token.startsWith('cf:')) return null;
+  const parts = token.split(':');
+  if (parts.length !== 2 || !parts[1]) return null;
+  const routeKey = parts[0];
+  return isAccessUserRouteKey(routeKey) || routeKey === '-1' || /^[1-9]\d*$/.test(routeKey)
+    ? routeKey : null;
+}
+
+export function isConnectTokenRouteAllowed(mode: AuthMode, routeKey: string): boolean {
+  if (mode === 'password') return routeKey === LOCAL_ADMIN_ROUTE_KEY;
+  if (mode === 'cf_access') return isAccessUserRouteKey(routeKey);
+  return /^[1-9]\d*$/.test(routeKey);
+}
+
+/**
+ * 认证模式解析（优先级）：
  * - ADMIN_PASSWORD_HASH 非空 → 密码模式（GitHub 配置原地保留但路由禁用）
+ * - request 具有 ctx.access 认证上下文，或 env.CF_ACCESS === 'true' → CF Access 模式
  * - 仅 GitHub ID+SECRET → GitHub 模式
- * - 都无 → 匿名模式（现状）
+ * - 都无 → 匿名模式
  * 哈希非空但格式损坏时仍返回 'password'：登录 fail closed，绝不静默回退。
  */
-export function resolveAuthMode(env: Env): AuthMode {
+export function resolveAuthMode(env: Env, request?: Request): AuthMode {
   const hash = env.ADMIN_PASSWORD_HASH;
   if (hash !== undefined && hash.trim() !== '') return 'password';
+  if ((request && accessIdentities.has(request)) || env.CF_ACCESS === 'true') {
+    return 'cf_access';
+  }
   if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) return 'github';
   return 'anonymous';
 }
@@ -194,10 +298,17 @@ function getGitHubAccessPolicy(env: Env): GitHubAccessPolicy {
   return { restricted: true, valid: true, allowedIds };
 }
 
-export function isGitHubUserAllowed(env: Env, githubId: string | number): boolean {
+function isGitHubUserAllowed(env: Env, githubId: string | number): boolean {
   const policy = getGitHubAccessPolicy(env);
   if (!policy.valid) return false;
   return !policy.restricted || policy.allowedIds.has(String(githubId));
+}
+
+/** 本地管理员与 Cloudflare Access 哨兵不是 GitHub 账号，不参与 GitHub 白名单。 */
+export function isSshIdentityAllowed(env: Env, githubId: string | number | null | undefined): boolean {
+  const id = String(githubId ?? '');
+  if (id === String(LOCAL_ADMIN_GITHUB_ID) || id === String(CF_ACCESS_USER_GITHUB_ID)) return true;
+  return isGitHubUserAllowed(env, id);
 }
 
 /**
@@ -232,6 +343,29 @@ function oauthFailure(message: string, status: number): Response {
  *   cookie 仍可认证。
  */
 export async function getAuthenticatedUser(request: Request, env: Env): Promise<UserInfo | null> {
+  const mode = resolveAuthMode(env, request);
+
+  // 1. CF Access 自动感知与免密鉴权
+  if (mode === 'cf_access') {
+    const email = getCFAccessEmail(request);
+    if (!email) return null;
+    const routeKey = await getAccessUserRouteKey(email);
+    const stub = getUserDBStub(env, routeKey);
+    const res = await stub.fetch(
+      new Request('http://internal/internal/access-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+    );
+    if (!res.ok) return null;
+    const user = await res.json<UserInfo>();
+    return {
+      ...user,
+      email,
+    };
+  }
+
   const cookies = parseCookies(request);
   const sessionToken = cookies.session;
   if (!sessionToken) return null;
@@ -239,7 +373,7 @@ export async function getAuthenticatedUser(request: Request, env: Env): Promise<
   const [routeKey] = sessionToken.split(':');
   if (!routeKey) return null;
 
-  if (resolveAuthMode(env) === 'password') {
+  if (mode === 'password') {
     if (routeKey !== LOCAL_ADMIN_ROUTE_KEY) return null;
     const parts = sessionToken.split(':');
     if (parts.length !== 3) return null;
@@ -260,8 +394,10 @@ export async function getAuthenticatedUser(request: Request, env: Env): Promise<
 
   if (!res.ok) return null;
   const user = await res.json<UserInfo>();
-  // 本地管理员不适用 GitHub 白名单（该名单仅约束 GitHub 账号）
-  if (user.github_id === LOCAL_ADMIN_GITHUB_ID) return user;
+  // 本地管理员与 CF Access 用户不适用 GitHub 白名单（该名单仅约束 GitHub 账号）
+  if (user.github_id === LOCAL_ADMIN_GITHUB_ID || user.github_id === CF_ACCESS_USER_GITHUB_ID) {
+    return user;
+  }
   return isGitHubUserAllowed(env, user.github_id) ? user : null;
 }
 
@@ -271,10 +407,10 @@ export async function getAuthenticatedUser(request: Request, env: Env): Promise<
  * GET /api/auth/github → 重定向到 GitHub 授权页
  */
 export async function handleGitHubAuth(request: Request, env: Env): Promise<Response> {
-  if (resolveAuthMode(env) === 'password') {
-    // 密码模式权威闸门：前端入口已替换为管理员登录，此处兜住直接 URL/旧标签页
+  const mode = resolveAuthMode(env, request);
+  if (mode === 'password' || mode === 'cf_access') {
     return Response.json(
-      { error: 'Password auth mode is active; remove ADMIN_PASSWORD_HASH to re-enable GitHub login' },
+      { error: 'GitHub login is disabled under the current authentication mode' },
       { status: 501 }
     );
   }
@@ -306,10 +442,11 @@ export async function handleGitHubAuth(request: Request, env: Env): Promise<Resp
  * 验证 state → 用 code 换 token → 获取用户信息 → 创建 session → Set-Cookie → 302
  */
 export async function handleGitHubCallback(request: Request, env: Env): Promise<Response> {
-  // 密码模式下堵死唯一的建用户入口（OAuth 回调 upsert），保持单管理员排他性
-  if (resolveAuthMode(env) === 'password') {
+  // Block legacy OAuth callbacks in both password and Access modes before any provider request.
+  const mode = resolveAuthMode(env, request);
+  if (mode === 'password' || mode === 'cf_access') {
     return Response.json(
-      { error: 'Password auth mode is active; remove ADMIN_PASSWORD_HASH to re-enable GitHub login' },
+      { error: 'GitHub login is disabled under the current authentication mode' },
       { status: 501 }
     );
   }
@@ -434,6 +571,22 @@ export async function handleGitHubCallback(request: Request, env: Env): Promise<
  * POST /api/auth/logout → 登出
  */
 export async function handleLogout(request: Request, env: Env): Promise<Response> {
+  if (resolveAuthMode(env, request) === 'cf_access') {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        authMode: 'cf_access',
+        logoutUrl: '/cdn-cgi/access/logout',
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': 'session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+        },
+      }
+    );
+  }
+
   const cookies = parseCookies(request);
   const sessionToken = cookies.session;
 
@@ -532,19 +685,30 @@ export async function handlePasswordLogin(request: Request, env: Env): Promise<R
     }
   }
 
-  // 登录节流（哨兵 DO 持久化，跨 isolate 权威；命中锁定直接拒绝，不泄露更多信息）
+  // 验证只需一次 SHA-256；预拉伸仍完全在浏览器执行，保持恒时比对。
+  const keyBytes = b64urlToBytes(key);
+  if (!keyBytes || keyBytes.length !== 32) {
+    return Response.json({ error: 'Invalid key format' }, { status: 400 });
+  }
+  const keyDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', keyBytes));
+  const valid = timingSafeEqualBytes(keyDigest, parsedHash.verifier);
+
+  // 在同一次 DO 操作里检查锁定并记录结果，避免并发请求一起穿过 check。
   const throttleRes = await stub.fetch(
     new Request('http://internal/internal/login-throttle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'check' }),
+      body: JSON.stringify({ action: 'attempt', valid }),
     })
   );
   if (!throttleRes.ok) {
     return Response.json({ error: 'Internal error' }, { status: 500 });
   }
-  const throttle = await throttleRes.json<{ locked: boolean; retryAfterSec: number }>();
-  if (throttle.locked) {
+  const throttle = await throttleRes.json<{ allowed: boolean; retryAfterSec: number }>();
+  if (typeof throttle.allowed !== 'boolean') {
+    return Response.json({ error: 'Internal error' }, { status: 500 });
+  }
+  if (!throttle.allowed) {
     console.warn(`[Auth] password_login result=denied reason=lockout ip=${clientIP}`);
     return Response.json(
       { error: 'Too many failed attempts', retryAfterSec: throttle.retryAfterSec },
@@ -554,33 +718,12 @@ export async function handlePasswordLogin(request: Request, env: Env): Promise<R
       }
     );
   }
-
-  // 验证预拉伸密钥：SHA-256(key) 恒时比对 verifier
-  const keyBytes = b64urlToBytes(key);
-  if (!keyBytes || keyBytes.length !== 32) {
-    return Response.json({ error: 'Invalid key format' }, { status: 400 });
-  }
-  const keyDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', keyBytes));
-  if (!timingSafeEqualBytes(keyDigest, parsedHash.verifier)) {
-    await stub.fetch(
-      new Request('http://internal/internal/login-throttle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'fail' }),
-      })
-    );
+  if (!valid) {
     console.warn(`[Auth] password_login result=denied reason=bad_key ip=${clientIP}`);
     return Response.json({ error: 'Invalid password' }, { status: 401 });
   }
 
-  // 登录成功：重置节流 → upsert 本地管理员 → 创建会话
-  await stub.fetch(
-    new Request('http://internal/internal/login-throttle', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'reset' }),
-    })
-  );
+  // 登录成功：节流已重置 → upsert 本地管理员 → 创建会话
 
   const userRes = await stub.fetch(
     new Request('http://internal/internal/local-admin-user', {
