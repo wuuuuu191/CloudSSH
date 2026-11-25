@@ -21,75 +21,107 @@ jobs:
       github.event.repository.fork == true &&
       (github.event_name == 'workflow_dispatch' || vars.AUTO_SYNC_UPSTREAM == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
       - name: Sync main branch from upstream
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_REPO: newbietan/CloudSSH
         run: |
           set -euo pipefail
 
-          error_file="$(mktemp)"
-          trap 'rm -f "$error_file"' EXIT
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch upstream main
 
-          if ! response=$(gh api \
-            --method POST \
-            "repos/${REPOSITORY}/merge-upstream" \
-            -f branch=main 2>"$error_file"); then
-            cat "$error_file" >&2
-            echo "::error title=上游同步失败::GitHub 无法同步 main 分支，请检查分支冲突或仓库权限。"
+          if [[ "$(git rev-parse HEAD)" == "$(git rev-parse upstream/main)" ]]; then
+            echo "当前 main 分支未落后于上游，无需同步"
+            {
+              echo "## 上游同步结果"
+              echo
+              echo "- 状态：当前 main 分支未落后于上游，无需同步"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          fail() {
+            echo "::error title=上游同步失败::$1"
             {
               echo "## 上游同步结果"
               echo
               echo "- 状态：同步失败"
-              echo "- 建议：检查分支冲突或仓库权限"
+              echo "- 建议：$2"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
+          }
+
+          # 用 git 合并而不是 merge-upstream 接口。GITHUB_TOKEN 没有
+          # workflows 权限，任何包含 workflow 文件变化的推送都会被
+          # GitHub 拒绝（422），所以合并提交本身必须不包含
+          # .github/workflows 的变化：先把 fork 自己的 workflow
+          # 文件恢复回来再提交。
+          #
+          # 注意：上一次同步恢复 workflow 文件后，fork 这边对这些文件
+          # 也有了“修改”，上游再改同一文件时合并会直接冲突。这种冲突
+          # 只涉及 workflow 文件时，用 fork 的版本解决并继续；只有
+          # 非 workflow 文件冲突时才中止。
+          if ! git merge --no-commit --no-ff upstream/main; then
+            conflicted=$(git diff --name-only --diff-filter=U || true)
+            non_workflow=$(printf '%s\n' "$conflicted" | grep -v '^\.github/workflows/' || true)
+            if [[ -z "$conflicted" ]] || [[ -n "$non_workflow" ]]; then
+              git merge --abort || true
+              fail "合并上游时出现冲突，请手动处理。" "合并存在冲突，请手动同步"
+            fi
+            git checkout --ours -- .github/workflows
+            git add -- .github/workflows
           fi
 
-          if [[ -s "$error_file" ]]; then
-            cat "$error_file" >&2
+          # 已包含上游全部提交（仅 fork 领先）时无需提交。
+          if git diff --cached --quiet; then
+            echo "当前 main 分支未落后于上游，无需同步"
+            {
+              echo "## 上游同步结果"
+              echo
+              echo "- 状态：当前 main 分支未落后于上游，无需同步"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          rm -f "$error_file"
-          trap - EXIT
 
-          merge_type=$(jq -r '.merge_type // "unknown"' <<< "$response")
-          base_branch=$(jq -r '.base_branch // "unknown"' <<< "$response")
-          detail=""
+          git restore --source=HEAD --staged --worktree -- .github/workflows || true
+          # 删除上游新增、fork 原本没有的 workflow 文件。
+          while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            git rm --cached --quiet -- "$f" || true
+            rm -f -- "$f"
+          done < <(git diff --cached --name-only --diff-filter=A -- .github/workflows || true)
+          # 清理合并带来的其他新增 workflow 文件。
+          while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            rm -f -- "$f"
+          done < <(git status --porcelain -- .github/workflows | awk '$1 == "??" {print $2}' || true)
 
-          case "$merge_type" in
-            none)
-              result="当前 main 分支未落后于上游，无需同步"
-              ;;
-            fast-forward)
-              result="已成功同步上游更新"
-              detail="合并方式：fast-forward"
-              ;;
-            merge)
-              result="已成功同步上游更新"
-              detail="合并方式：merge"
-              ;;
-            *)
-              result="GitHub 已完成同步请求"
-              detail="合并方式：${merge_type}"
-              ;;
-          esac
-
-          echo "上游分支：${base_branch}"
-          echo "同步结果：${result}"
-          if [[ -n "$detail" ]]; then
-            echo "$detail"
+          if ! git diff --cached --quiet -- .github/workflows || ! git diff --quiet -- .github/workflows; then
+            git merge --abort || true
+            fail "合并后 workflow 文件仍有变化，为避免推送被拒已中止。" "上游 workflow 变化无法自动处理，请手动同步"
           fi
-          echo "::notice title=上游同步::${result}"
 
+          git commit --no-edit
+          git push origin main
+
+          echo "上游分支：main"
+          echo "同步结果：已成功同步上游更新（合并提交，fork 的 workflow 文件保持不变）"
+          echo "::notice title=上游同步::已成功同步上游更新"
           {
             echo "## 上游同步结果"
             echo
-            echo "- 上游分支：\`${base_branch}\`"
-            echo "- 状态：${result}"
-            if [[ -n "$detail" ]]; then
-              echo "- ${detail}"
-            fi
+            echo "- 上游分支：\`main\`"
+            echo "- 状态：已成功同步上游更新"
+            echo "- 合并方式：merge（fork 的 workflow 文件保持不变）"
           } >> "$GITHUB_STEP_SUMMARY"
